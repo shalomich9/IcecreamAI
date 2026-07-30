@@ -1,333 +1,233 @@
-import os
-import asyncio
-import httpx
 import streamlit as st
+import asyncio
+import re
+from config import config
+from agents import generate_response
 
-# ============================================================
-# КЛЮЧИ
-# Локально можно задать через переменные окружения.
-# На Streamlit Community Cloud задаются в Settings -> Secrets
-# в формате: KEY = "значение" (по одной строке на ключ).
-# ============================================================
-def get_secret(key: str) -> str:
-    val = os.environ.get(key, "")
-    if val:
-        return val
-    try:
-        return st.secrets.get(key, "")
-    except Exception:
-        return ""
+st.set_page_config(page_title="AI Council Simulator", layout="wide", initial_sidebar_state="expanded")
 
+# Initialize session state
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "agent_outputs" not in st.session_state:
+    st.session_state.agent_outputs = {"DeepSeek": "", "GLM": "", "Qwen": "", "Evaluator": ""}
+if "agent_status" not in st.session_state:
+    st.session_state.agent_status = {"DeepSeek": "Ожидание", "GLM": "Ожидание", "Qwen": "Ожидание", "Evaluator": "Ожидание"}
+if "is_running" not in st.session_state:
+    st.session_state.is_running = False
 
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
-GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
-TAVILY_API_KEY = get_secret("TAVILY_API_KEY")  # tavily.com, 1000 бесплатных запросов/месяц
+def extract_final_answer(text: str) -> str:
+    """Extracts the [ФИНАЛ] block from an agent's response."""
+    match = re.search(r'\[ФИНАЛ\](.*)', text, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else text.strip()
 
-# ============================================================
-# АВТОПОДБОР МОДЕЛЕЙ
-# Бесплатные модели у OpenRouter и Google меняются очень часто
-# (список может обновляться раз в несколько дней). Вместо того
-# чтобы вручную вписывать ID, код сам спрашивает у обоих сервисов,
-# что доступно ПРЯМО СЕЙЧАС, и подставляет рабочие варианты.
-# Обновляется раз в час (кэш), чтобы не дёргать API на каждый запрос.
-# ============================================================
-async def fetch_openrouter_free_models() -> list:
-    """Живой список бесплатных моделей OpenRouter (id вида provider/model:free)."""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get("https://openrouter.ai/api/v1/models")
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception:
-        return []
-
-    free_ids = []
-    for m in data.get("data", []):
-        model_id = m.get("id", "")
-        pricing = m.get("pricing", {})
-        try:
-            prompt_price = float(pricing.get("prompt") or 1)
-            completion_price = float(pricing.get("completion") or 1)
-        except (TypeError, ValueError):
-            continue
-        if prompt_price == 0 and completion_price == 0 and model_id.endswith(":free"):
-            free_ids.append(model_id)
-    return free_ids
-
-
-async def fetch_gemini_flash_model() -> str:
-    """Спрашивает у Google, какая Flash-модель сейчас доступна для generateContent."""
-    if not GOOGLE_API_KEY:
-        return "gemini-2.0-flash"
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception:
-        return "gemini-2.0-flash"
-
-    candidates = []
-    for m in data.get("models", []):
-        name = m.get("name", "").replace("models/", "")
-        methods = m.get("supportedGenerationMethods", [])
-        if "generateContent" in methods and "flash" in name.lower():
-            candidates.append(name)
-
-    stable = [c for c in candidates if "exp" not in c and "preview" not in c and "8b" not in c]
-    pool = stable or candidates
-    return pool[0] if pool else "gemini-2.0-flash"
-
-
-def pretty_model_name(model_id: str) -> str:
-    if model_id == "openrouter/free":
-        return "OpenRouter (авто)"
-    base = model_id.split("/")[-1].replace(":free", "")
-    return base.replace("-", " ").title()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def resolve_models():
-    free_models = asyncio.run(fetch_openrouter_free_models())
-    gemini_model_id = asyncio.run(fetch_gemini_flash_model())
-
-    # предпочитаем разные "семейства" моделей для разнообразия мнений
-    pref_a = [m for m in free_models if any(k in m.lower() for k in ["deepseek", "qwen", "nemotron", "gpt-oss", "hermes", "kimi"])]
-    pref_b = [m for m in free_models if "glm" in m.lower()]
-
-    model_a = pref_a[0] if pref_a else (free_models[0] if free_models else "openrouter/free")
-    model_b = pref_b[0] if pref_b else next((m for m in free_models if m != model_a), "openrouter/free")
-
-    return [
-        {"name": pretty_model_name(model_a), "provider": "openrouter", "model_id": model_a},
-        {"name": pretty_model_name(model_b), "provider": "openrouter", "model_id": model_b},
-        {"name": pretty_model_name(gemini_model_id), "provider": "google", "model_id": gemini_model_id},
+async def run_agent(agent_name: str, task: str, role_prompt: str, placeholder, status_placeholder):
+    """Stage 1: Generate initial response from an agent."""
+    st.session_state.agent_status[agent_name] = "Думает..."
+    status_placeholder.info(f"**{agent_name}**: Думает...")
+    
+    messages = [
+        {"role": "system", "content": f"{config.SYSTEM_PROMPT}\n\n{role_prompt}"},
+        {"role": "user", "content": task}
     ]
+    
+    st.session_state.agent_outputs[agent_name] = ""
+    
+    async for item in generate_response(agent_name, messages, use_tools=True, stream=True):
+        if isinstance(item, dict):
+            if item["type"] == "content":
+                st.session_state.agent_outputs[agent_name] += item["data"]
+                placeholder.markdown(st.session_state.agent_outputs[agent_name])
+            elif item["type"] == "status":
+                st.session_state.agent_status[agent_name] = item["data"]
+                status_placeholder.info(f"**{agent_name}**: {item['data']}")
+            elif item["type"] == "error":
+                st.session_state.agent_outputs[agent_name] += f"\n\n**Error:** {item['data']}"
+                placeholder.markdown(st.session_state.agent_outputs[agent_name])
+        else:
+            st.session_state.agent_outputs[agent_name] += str(item)
+            placeholder.markdown(st.session_state.agent_outputs[agent_name])
 
+    st.session_state.agent_status[agent_name] = "Завершил Этап 1"
+    status_placeholder.success(f"**{agent_name}**: Завершил Этап 1")
+    return st.session_state.agent_outputs[agent_name]
 
-MODELS = resolve_models()
-
-# ============================================================
-# LEVEL 5 — разбит на 4 последовательных шага с разной температурой.
-# Температуру каждого шага можно смело менять здесь.
-# ============================================================
-BASE_SYSTEM_PROMPT = """Ты работаешь в режиме глубокого критического анализа, разбитого на шаги. Без приветствий, без вежливых вступлений, без воды — сразу к сути. Отвечай только на текущий шаг, не забегай вперёд и не повторяй то, что уже сказал на предыдущих шагах."""
-
-TEMP_IDEAL = 1.1      # шаг 1: идеальный вариант — высокая креативность
-TEMP_BLOCKS = 0.2     # шаг 2: разбивка на блоки — минимум, нужна точность
-TEMP_VARIANTS = 1.0   # шаг 3: варианты по блокам — выше среднего, нужен разброс
-TEMP_FINAL = 0.3      # шаг 4: итоговая оценка — низкая, чтобы не галлюцинировал
-
-STAGE_1_IDEAL = """Тебе может быть передан блок "ДАННЫЕ ИЗ ПОИСКА" — свежая информация из интернета. Обязательно учти её, если она есть; если её нет или она не по теме — работай на своих знаниях и явно укажи это.
-
-{search_block}ЗАДАЧА:
-{user_message}
-
-Шаг 1.
-1) Сформулируй одним предложением ЦЕЛЬ — конечную точку, которую нужно получить.
-2) Опиши ИДЕАЛЬНЫЙ ВАРИАНТ решения без ограничений — как будто время, ресурсы и технические барьеры не важны. Будь смелым и нестандартным, это ориентир для дальнейшей работы, а не финальный ответ."""
-
-STAGE_2_BLOCKS = """Шаг 2. Основываясь на цели и идеальном варианте из шага 1, раздели задачу на чёткие логические блоки (составные части решения). Пока не предлагай варианты решения — только сама структура блоков, по одному предложению на блок (что за блок и зачем он нужен). Будь точным и лаконичным."""
-
-STAGE_3_VARIANTS = """Шаг 3. Для каждого блока из шага 2 предложи 2-3 конкретных варианта решения. На этом шаге ценится широта: не бойся нестандартных и даже почти нереализуемых вариантов. По каждому варианту коротко укажи реализуемость (высокая/средняя/низкая) и главный риск."""
-
-STAGE_4_FINAL = """Шаг 4. Трезво оцени всё предложенное выше. Собери из вариантов по блокам одну итоговую реалистичную комбинацию — ближе всего к идеальному варианту, но реально осуществимую. Будь максимально объективным: не приукрашивай, не выдумывай факты, отбрось нереалистичные варианты. Заверши одним абзацем, почему выбрана именно эта комбинация."""
-
-
-# ============================================================
-# ВЫЗОВ OPENROUTER (DeepSeek, GLM)
-# ============================================================
-async def call_openrouter_model(model_id: str, messages: list, temperature: float) -> str:
-    if not OPENROUTER_API_KEY:
-        return "[Ошибка: не задан OPENROUTER_API_KEY в Secrets]"
-    try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            resp = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model_id,
-                    "messages": messages,
-                    "temperature": temperature,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            return "[Недоступно: превышен бесплатный лимит запросов. Попробуйте через пару минут.]"
-        detail = e.response.text[:150]
-        return f"[Ошибка запроса: {e.response.status_code} — {detail}]"
-    except Exception as e:
-        return f"[Ошибка: {str(e)[:200]}]"
-
-
-# ============================================================
-# ВЫЗОВ GOOGLE AI STUDIO (Gemini)
-# ============================================================
-async def call_gemini_model(model_id: str, system_prompt: str, contents: list, temperature: float) -> str:
-    if not GOOGLE_API_KEY:
-        return "[Ошибка: не задан GOOGLE_API_KEY в Secrets]"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={GOOGLE_API_KEY}"
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": contents,
-        "generationConfig": {"temperature": temperature},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            return "[Недоступно: превышен бесплатный лимит запросов. Попробуйте через пару минут.]"
-        detail = e.response.text[:150]
-        return f"[Ошибка запроса: {e.response.status_code} — {detail}]"
-    except Exception as e:
-        return f"[Ошибка: {str(e)[:200]}]"
-
-
-def is_error_text(text: str) -> bool:
-    return text.startswith("[Ошибка") or text.startswith("[Недоступно")
-
-
-# ============================================================
-# ПОЛНЫЙ ПРОХОД ПО 4 ШАГАМ ДЛЯ ОДНОЙ МОДЕЛИ
-# ============================================================
-async def run_level5_pipeline(model_cfg: dict, user_message: str, search_context: str):
-    search_block = f"ДАННЫЕ ИЗ ПОИСКА:\n{search_context}\n\n" if search_context else ""
-
-    stages = [
-        (STAGE_1_IDEAL.format(search_block=search_block, user_message=user_message), TEMP_IDEAL, "ЦЕЛЬ и ИДЕАЛЬНЫЙ ВАРИАНТ"),
-        (STAGE_2_BLOCKS, TEMP_BLOCKS, "БЛОКИ"),
-        (STAGE_3_VARIANTS, TEMP_VARIANTS, "ВАРИАНТЫ ПО БЛОКАМ"),
-        (STAGE_4_FINAL, TEMP_FINAL, "ИТОГОВАЯ КОМБИНАЦИЯ"),
+async def run_debate(agent_name: str, own_text: str, other_answers: dict, placeholder, status_placeholder):
+    """Stage 2: Cross debate."""
+    st.session_state.agent_status[agent_name] = "Критикует..."
+    status_placeholder.info(f"**{agent_name}**: Критикует...")
+    
+    critique_prompt = "Проанализируй ответы других нейросетей на ту же задачу. В чем они ошибаются? В чем их сильные стороны? Согласен ли ты с ними? Ответь кратко (1-2 абзаца).\n\n"
+    for name, answer in other_answers.items():
+        if name != agent_name:
+            critique_prompt += f"--- Ответ {name} ---\n{extract_final_answer(answer)}\n\n"
+            
+    st.session_state.agent_outputs[agent_name] += "\n\n---\n**[ЭТАП 2: ДЕБАТЫ]**\n\n"
+    placeholder.markdown(st.session_state.agent_outputs[agent_name])
+    
+    messages = [
+        {"role": "system", "content": f"Твоя задача критиковать решения коллег. Ты - {agent_name}. Твоя логика: {config.SYSTEM_PROMPT}"},
+        {"role": "user", "content": f"Твой изначальный ответ: {extract_final_answer(own_text)}"},
+        {"role": "user", "content": critique_prompt}
     ]
+    
+    async for item in generate_response(agent_name, messages, use_tools=False, stream=True):
+        if isinstance(item, dict) and item["type"] == "content":
+            st.session_state.agent_outputs[agent_name] += item["data"]
+            placeholder.markdown(st.session_state.agent_outputs[agent_name])
+        elif isinstance(item, dict) and item["type"] == "error":
+            st.session_state.agent_outputs[agent_name] += f"\n\n**Error:** {item['data']}"
+            placeholder.markdown(st.session_state.agent_outputs[agent_name])
 
-    output_parts = []
+    st.session_state.agent_status[agent_name] = "Завершил Этап 2"
+    status_placeholder.success(f"**{agent_name}**: Завершил Этап 2")
 
-    if model_cfg["provider"] == "openrouter":
-        messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-        for prompt_text, temperature, label in stages:
-            messages.append({"role": "user", "content": prompt_text})
-            reply = await call_openrouter_model(model_cfg["model_id"], messages, temperature)
-            if is_error_text(reply):
-                output_parts.append(f"**{label}:** {reply}")
-                break
-            messages.append({"role": "assistant", "content": reply})
-            output_parts.append(f"**{label}:**\n{reply}")
-    else:
-        contents = []
-        for prompt_text, temperature, label in stages:
-            contents.append({"role": "user", "parts": [{"text": prompt_text}]})
-            reply = await call_gemini_model(model_cfg["model_id"], BASE_SYSTEM_PROMPT, contents, temperature)
-            if is_error_text(reply):
-                output_parts.append(f"**{label}:** {reply}")
-                break
-            contents.append({"role": "model", "parts": [{"text": reply}]})
-            output_parts.append(f"**{label}:**\n{reply}")
+async def run_evaluator(task: str, all_outputs: dict, placeholder, status_placeholder):
+    """Stage 3: Evaluator."""
+    st.session_state.agent_status["Evaluator"] = "Анализирует..."
+    status_placeholder.info(f"**Evaluator**: Анализирует...")
+    
+    context = f"ЗАДАЧА: {task}\n\nОТВЕТЫ АГЕНТОВ И ИХ ДЕБАТЫ:\n"
+    for name, text in all_outputs.items():
+        if name != "Evaluator":
+            context += f"=== {name} ===\n{text}\n\n"
+            
+    messages = [
+        {"role": "system", "content": config.EVALUATOR_PROMPT},
+        {"role": "user", "content": context}
+    ]
+    
+    st.session_state.agent_outputs["Evaluator"] = ""
+    async for item in generate_response("Evaluator", messages, use_tools=False, stream=True):
+         if isinstance(item, dict) and item["type"] == "content":
+            st.session_state.agent_outputs["Evaluator"] += item["data"]
+            placeholder.markdown(st.session_state.agent_outputs["Evaluator"])
+            
+    st.session_state.agent_status["Evaluator"] = "Готово"
+    status_placeholder.success(f"**Evaluator**: Готово")
 
-    return model_cfg["name"], "\n\n".join(output_parts)
+async def main_pipeline(task: str, placeholders_dict, status_placeholders_dict):
+    st.session_state.is_running = True
+    
+    # Stage 1
+    t1 = run_agent("DeepSeek", task, config.DEEPSEEK_PROMPT, placeholders_dict["DeepSeek"], status_placeholders_dict["DeepSeek"])
+    t2 = run_agent("GLM", task, config.GLM_PROMPT, placeholders_dict["GLM"], status_placeholders_dict["GLM"])
+    t3 = run_agent("Qwen", task, config.QWEN_PROMPT, placeholders_dict["Qwen"], status_placeholders_dict["Qwen"])
+    
+    res1, res2, res3 = await asyncio.gather(t1, t2, t3)
+    
+    # Stage 2
+    answers = {"DeepSeek": res1, "GLM": res2, "Qwen": res3}
+    d1 = run_debate("DeepSeek", res1, answers, placeholders_dict["DeepSeek"], status_placeholders_dict["DeepSeek"])
+    d2 = run_debate("GLM", res2, answers, placeholders_dict["GLM"], status_placeholders_dict["GLM"])
+    d3 = run_debate("Qwen", res3, answers, placeholders_dict["Qwen"], status_placeholders_dict["Qwen"])
+    
+    await asyncio.gather(d1, d2, d3)
+    
+    # Stage 3
+    await run_evaluator(task, st.session_state.agent_outputs, placeholders_dict["Evaluator"], status_placeholders_dict["Evaluator"])
+    
+    st.session_state.is_running = False
+    
+    # Save to history
+    st.session_state.chat_history.append({
+        "task": task,
+        "evaluator": st.session_state.agent_outputs["Evaluator"]
+    })
 
+# --- UI ---
 
-# ============================================================
-# ВЕБ-ПОИСК (Tavily) — один запрос на всю задачу
-# ============================================================
-async def search_web(query: str) -> str:
-    if not TAVILY_API_KEY:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": TAVILY_API_KEY,
-                    "query": query,
-                    "search_depth": "basic",
-                    "max_results": 5,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                return ""
-            parts = []
-            for r in results:
-                title = r.get("title", "")
-                content = r.get("content", "")[:500]
-                url = r.get("url", "")
-                parts.append(f"- {title}\n  {content}\n  Источник: {url}")
-            return "\n\n".join(parts)
-    except Exception:
-        return ""
+st.sidebar.title("🧠 AI Council")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Статусы")
+for agent in ["DeepSeek", "GLM", "Qwen", "Evaluator"]:
+    status = st.session_state.agent_status.get(agent, "Ожидание")
+    st.sidebar.caption(f"**{agent}**: {status}")
 
-# ============================================================
-# ИНТЕРФЕЙС (Streamlit)
-# ============================================================
-st.set_page_config(page_title="AI Council", page_icon="🧠", layout="centered")
-st.title("🧠 Мульти-ИИ консилиум")
-st.caption("Этап 1: каждая модель прорабатывает задачу независимо (Level 5, 4 шага).")
-st.caption("Сейчас работают: " + ", ".join(m["name"] for m in MODELS))
-
-if "history" not in st.session_state:
-    st.session_state.history = []  # список {"role": "user"/"assistant", "content": str}
-
-# показать уже накопленную историю
-for msg in st.session_state.history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-if st.button("Очистить чат"):
-    st.session_state.history = []
+st.sidebar.markdown("---")
+if st.sidebar.button("Очистить историю"):
+    st.session_state.chat_history = []
+    st.session_state.agent_outputs = {k: "" for k in st.session_state.agent_outputs}
+    st.session_state.agent_status = {k: "Ожидание" for k in st.session_state.agent_status}
     st.rerun()
 
-user_message = st.chat_input("Опишите задачу или проблему...")
+st.sidebar.markdown("---")
+st.sidebar.subheader("История сессий")
+for i, h in enumerate(st.session_state.chat_history):
+    with st.sidebar.expander(f"Сессия {i+1}"):
+        st.write(h["task"][:50] + "...")
+        st.markdown(h["evaluator"])
 
-if user_message:
-    st.session_state.history.append({"role": "user", "content": user_message})
-    with st.chat_message("user"):
-        st.markdown(user_message)
+# Main Content
+st.title("🏛 Мультиагентный Консилиум")
+st.markdown("Задайте сложную задачу, и консилиум из 3 нейросетей разберет ее, проведет дебаты, а главный оценщик выдаст финальный вердикт.")
 
-    search_context = ""
-    if TAVILY_API_KEY:
-        with st.chat_message("assistant"):
-            search_box = st.empty()
-            search_box.markdown("_🔍 Ищу информацию по теме..._")
-            search_context = asyncio.run(search_web(user_message))
-            if search_context:
-                search_text = f"**🔍 Найдено в интернете:**\n\n{search_context}"
-                search_box.markdown(search_text)
-                st.session_state.history.append({"role": "assistant", "content": search_text})
-            else:
-                search_box.empty()
+task_input = st.text_area("Введите задачу (Level 5 Reasoning):", height=100)
 
-    # создаём placeholder на каждую модель заранее, заполняем по готовности
-    placeholders = {}
-    for m in MODELS:
-        with st.chat_message("assistant"):
-            box = st.empty()
-            box.markdown(f"_{m['name']} думает..._")
-            placeholders[m["name"]] = box
+if st.button("Запустить симуляцию", disabled=st.session_state.is_running):
+    if task_input:
+        # Clear previous outputs
+        st.session_state.agent_outputs = {k: "" for k in st.session_state.agent_outputs}
+        st.session_state.agent_status = {k: "Подготовка..." for k in st.session_state.agent_status}
+        
+        # UI containers for tabs
+        tab_eval, tab_ds, tab_glm, tab_qwen = st.tabs(["Главный чат (Оценщик)", "DeepSeek", "GLM", "Qwen"])
+        
+        with tab_eval:
+            st.subheader("Главный чат")
+            status_eval = st.empty()
+            content_eval = st.empty()
+            
+        with tab_ds:
+            st.subheader("🧠 DeepSeek - Личный чат")
+            status_ds = st.empty()
+            content_ds = st.empty()
+            
+        with tab_glm:
+            st.subheader("💡 GLM - Личный чат")
+            status_glm = st.empty()
+            content_glm = st.empty()
+            
+        with tab_qwen:
+            st.subheader("🏗️ Qwen - Личный чат")
+            status_qwen = st.empty()
+            content_qwen = st.empty()
 
-    async def run_all():
-        tasks = [
-            asyncio.create_task(run_level5_pipeline(m, user_message, search_context))
-            for m in MODELS
-        ]
-        for coro in asyncio.as_completed(tasks):
-            name, text = await coro
-            content = f"**{name}:**\n\n{text}"
-            placeholders[name].markdown(content)
-            st.session_state.history.append({"role": "assistant", "content": content})
+        placeholders = {
+            "Evaluator": content_eval,
+            "DeepSeek": content_ds,
+            "GLM": content_glm,
+            "Qwen": content_qwen
+        }
+        
+        status_placeholders = {
+            "Evaluator": status_eval,
+            "DeepSeek": status_ds,
+            "GLM": status_glm,
+            "Qwen": status_qwen
+        }
 
-    asyncio.run(run_all())
+        # Run asyncio event loop for pipeline
+        asyncio.run(main_pipeline(task_input, placeholders, status_placeholders))
+        st.rerun()
+
+# If not running and there is output, show it (so it persists after rerun)
+elif not st.session_state.is_running and any(st.session_state.agent_outputs.values()):
+    tab_eval, tab_ds, tab_glm, tab_qwen = st.tabs(["Главный чат (Оценщик)", "DeepSeek", "GLM", "Qwen"])
+    
+    with tab_eval:
+        st.subheader("Главный чат")
+        st.markdown(st.session_state.agent_outputs["Evaluator"])
+        
+    with tab_ds:
+        st.subheader("🧠 DeepSeek - Личный чат")
+        st.markdown(st.session_state.agent_outputs["DeepSeek"])
+        
+    with tab_glm:
+        st.subheader("💡 GLM - Личный чат")
+        st.markdown(st.session_state.agent_outputs["GLM"])
+        
+    with tab_qwen:
+        st.subheader("🏗️ Qwen - Личный чат")
+        st.markdown(st.session_state.agent_outputs["Qwen"])

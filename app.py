@@ -15,9 +15,10 @@ css = """
         font-family: 'Outfit', sans-serif !important;
     }
     
-    /* Force dark mode */
+    /* Force dark mode and full-page gradient */
     .stApp, .main {
-        background-color: #0b0f19 !important; 
+        background: linear-gradient(180deg, #020617 0%, #0f172a 100%) !important;
+        background-attachment: fixed !important;
         color: #e2e8f0 !important;
     }
     
@@ -36,8 +37,13 @@ css = """
         border-radius: 20px !important;
         box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
     }
-    [data-testid="stChatInput"] textarea {
+    /* Extremely aggressive text color override for light mode */
+    [data-testid="stChatInput"] textarea, div[data-baseweb="textarea"] textarea {
         color: #f8fafc !important;
+        -webkit-text-fill-color: #f8fafc !important;
+        background-color: transparent !important;
+    }
+    div[data-baseweb="base-input"] {
         background-color: transparent !important;
     }
     [data-testid="stChatInput"] button {
@@ -195,23 +201,31 @@ async def run_evaluator(task: str, all_outputs: dict, placeholder, status_placeh
     st.session_state.agent_status["Evaluator"] = "Готово"
     status_placeholder.empty() # Remove the thinking box when done
 
-async def main_pipeline(task: str, placeholders_dict, status_placeholders_dict):
+async def main_pipeline(task: str, placeholders_dict, status_placeholders_dict, global_status_placeholder):
     # Stage 1
+    global_status_placeholder.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Агенты собирают информацию и готовят анализ...</i></div>", unsafe_allow_html=True)
     t1 = run_agent("DeepSeek", task, config.DEEPSEEK_PROMPT, placeholders_dict["DeepSeek"], status_placeholders_dict["DeepSeek"])
     t2 = run_agent("GLM", task, config.GLM_PROMPT, placeholders_dict["GLM"], status_placeholders_dict["GLM"])
     t3 = run_agent("Qwen", task, config.QWEN_PROMPT, placeholders_dict["Qwen"], status_placeholders_dict["Qwen"])
     
-    res1, res2, res3 = await asyncio.gather(t1, t2, t3)
+    res1, res2, res3 = await asyncio.gather(t1, t2, t3, return_exceptions=True)
+    
+    # Handle possible exceptions returned by gather
+    if isinstance(res1, Exception): res1 = f"Error: {res1}"
+    if isinstance(res2, Exception): res2 = f"Error: {res2}"
+    if isinstance(res3, Exception): res3 = f"Error: {res3}"
     
     # Stage 2
+    global_status_placeholder.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Консилиум проводит дебаты и критикует решения...</i></div>", unsafe_allow_html=True)
     answers = {"DeepSeek": res1, "GLM": res2, "Qwen": res3}
     d1 = run_debate("DeepSeek", res1, answers, placeholders_dict["DeepSeek"], status_placeholders_dict["DeepSeek"])
     d2 = run_debate("GLM", res2, answers, placeholders_dict["GLM"], status_placeholders_dict["GLM"])
     d3 = run_debate("Qwen", res3, answers, placeholders_dict["Qwen"], status_placeholders_dict["Qwen"])
     
-    await asyncio.gather(d1, d2, d3)
+    await asyncio.gather(d1, d2, d3, return_exceptions=True)
     
     # Stage 3
+    global_status_placeholder.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Главный Оценщик формирует финальный вердикт...</i></div>", unsafe_allow_html=True)
     await run_evaluator(task, st.session_state.agent_outputs, placeholders_dict["Evaluator"], status_placeholders_dict["Evaluator"])
 
 
@@ -272,7 +286,7 @@ if st.session_state.is_running and st.session_state.current_prompt:
              eval_status_pl = st.empty()
              eval_content_pl = st.empty()
              
-             eval_status_pl.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Консилиум начал дебаты...</i></div>", unsafe_allow_html=True)
+             eval_status_pl.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Инициализация ИИ-консилиума...</i></div>", unsafe_allow_html=True)
              
     placeholders = {
         "Evaluator": eval_content_pl,
@@ -287,7 +301,7 @@ if st.session_state.is_running and st.session_state.current_prompt:
         "Qwen": sidebar_placeholders["Qwen"]["status"]
     }
     
-    asyncio.run(main_pipeline(prompt, placeholders, status_placeholders))
+    asyncio.run(main_pipeline(prompt, placeholders, status_placeholders, eval_status_pl))
     
     # Finalize
     st.session_state.chat_history.append({"role": "assistant", "content": st.session_state.agent_outputs["Evaluator"]})

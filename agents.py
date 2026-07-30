@@ -91,88 +91,92 @@ async def generate_response(agent_name: str, messages: list, use_tools: bool = T
         kwargs["tools"] = [tavily_tool]
         kwargs["tool_choice"] = "auto"
     
-    try:
-        if stream:
-            stream_response = await client.chat.completions.create(**kwargs)
-            
-            # Handle tool calls in stream (simplified for now, full tool calling in streams can be complex)
-            # To keep it robust, we'll collect the whole response if tools are called, or stream if not.
-            # Wait, tool calls in stream require buffering. Let's do non-streaming for tool calls first, 
-            # and then stream the final answer. 
-            
-            # Actually, standard streaming approach:
-            tool_calls = []
-            full_content = ""
-            
-            async for chunk in stream_response:
-                delta = chunk.choices[0].delta
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if stream:
+                stream_response = await client.chat.completions.create(**kwargs)
                 
-                # Check for tool calls
-                if delta.tool_calls:
-                    for tc_chunk in delta.tool_calls:
-                        if len(tool_calls) <= tc_chunk.index:
-                            tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                        tc = tool_calls[tc_chunk.index]
-                        
-                        if tc_chunk.id: tc["id"] += tc_chunk.id
-                        if tc_chunk.function.name: tc["function"]["name"] += tc_chunk.function.name
-                        if tc_chunk.function.arguments: tc["function"]["arguments"] += tc_chunk.function.arguments
+                tool_calls = []
+                full_content = ""
                 
-                elif delta.content:
-                    full_content += delta.content
-                    yield {"type": "content", "data": delta.content}
-            
-            if tool_calls:
-                yield {"type": "status", "data": "Ищу информацию в интернете..."}
-                messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+                async for chunk in stream_response:
+                    delta = chunk.choices[0].delta
+                    
+                    if delta.tool_calls:
+                        for tc_chunk in delta.tool_calls:
+                            if len(tool_calls) <= tc_chunk.index:
+                                tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            tc = tool_calls[tc_chunk.index]
+                            
+                            if tc_chunk.id: tc["id"] += tc_chunk.id
+                            if tc_chunk.function.name: tc["function"]["name"] += tc_chunk.function.name
+                            if tc_chunk.function.arguments: tc["function"]["arguments"] += tc_chunk.function.arguments
+                    
+                    elif delta.content:
+                        full_content += delta.content
+                        yield {"type": "content", "data": delta.content}
                 
-                for tool_call in tool_calls:
-                    if tool_call["function"]["name"] == "search_internet":
-                        try:
-                            args = json.loads(tool_call["function"]["arguments"])
-                            query = args.get("query")
-                            search_result = await search_tavily(query)
+                if tool_calls:
+                    yield {"type": "status", "data": "Ищу информацию в интернете..."}
+                    messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+                    
+                    for tool_call in tool_calls:
+                        if tool_call["function"]["name"] == "search_internet":
+                            try:
+                                args = json.loads(tool_call["function"]["arguments"])
+                                query = args.get("query")
+                                search_result = await search_tavily(query)
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call["id"],
+                                    "name": tool_call["function"]["name"],
+                                    "content": search_result
+                                })
+                            except Exception as e:
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call["id"],
+                                    "name": tool_call["function"]["name"],
+                                    "content": f"Error parsing tool args: {e}"
+                                })
+                    
+                    yield {"type": "status", "data": "Анализирую результаты поиска..."}
+                    
+                    async for item in generate_response(agent_name, messages, use_tools=False, stream=True):
+                        yield item
+                
+                return # Successfully streamed
+
+            else:
+                response = await client.chat.completions.create(**kwargs)
+                message = response.choices[0].message
+                if message.tool_calls:
+                    messages.append(message)
+                    for tool_call in message.tool_calls:
+                        if tool_call.function.name == "search_internet":
+                            args = json.loads(tool_call.function.arguments)
+                            search_result = await search_tavily(args.get("query"))
                             messages.append({
                                 "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "name": tool_call["function"]["name"],
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.function.name,
                                 "content": search_result
                             })
-                        except Exception as e:
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "name": tool_call["function"]["name"],
-                                "content": f"Error parsing tool args: {e}"
-                            })
+                    
+                    async for item in generate_response(agent_name, messages, use_tools=False, stream=False):
+                        yield item
+                else:
+                    yield message.content
                 
-                # Yield the status that we are analyzing the search results
-                yield {"type": "status", "data": "Анализирую результаты поиска..."}
-                
-                # Recursively call without tools to get the final answer based on search
-                async for item in generate_response(agent_name, messages, use_tools=False, stream=True):
-                    yield item
+                return # Successfully fetched
 
-        else:
-            # Non-streaming
-            response = await client.chat.completions.create(**kwargs)
-            message = response.choices[0].message
-            if message.tool_calls:
-                messages.append(message)
-                for tool_call in message.tool_calls:
-                    if tool_call.function.name == "search_internet":
-                        args = json.loads(tool_call.function.arguments)
-                        search_result = await search_tavily(args.get("query"))
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.function.name,
-                            "content": search_result
-                        })
-                # Re-call without tools
-                async for item in generate_response(agent_name, messages, use_tools=False, stream=False):
-                    yield item
+        except Exception as e:
+            if attempt == max_retries - 1:
+                yield {"type": "error", "data": f"API Error: {e}"}
+                return
             else:
-                yield message.content
-    except Exception as e:
-        yield {"type": "error", "data": f"API Error: {e}"}
+                # Wait and retry
+                wait_time = 2 ** attempt
+                yield {"type": "status", "data": f"Сбой API, повтор через {wait_time}с..."}
+                await asyncio.sleep(wait_time)

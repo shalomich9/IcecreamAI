@@ -158,7 +158,7 @@ async def generate_response(agent_name: str, messages: list, use_tools: bool = T
                     yield item
 
         else:
-            # Non-streaming (used for evaluator maybe)
+            # Non-streaming
             response = await client.chat.completions.create(**kwargs)
             message = response.choices[0].message
             if message.tool_calls:
@@ -174,8 +174,9 @@ async def generate_response(agent_name: str, messages: list, use_tools: bool = T
                             "content": search_result
                         })
                 # Re-call without tools
-                return await generate_response(agent_name, messages, use_tools=False, stream=False)
+                async for item in generate_response(agent_name, messages, use_tools=False, stream=False):
+                    yield item
             else:
-                return message.content
+                yield message.content
     except Exception as e:
         yield {"type": "error", "data": f"API Error: {e}"}

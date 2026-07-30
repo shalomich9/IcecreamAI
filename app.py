@@ -204,25 +204,40 @@ async def run_evaluator(task: str, all_outputs: dict, placeholder, status_placeh
 async def main_pipeline(task: str, placeholders_dict, status_placeholders_dict, global_status_placeholder):
     # Stage 1
     global_status_placeholder.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Агенты собирают информацию и готовят анализ...</i></div>", unsafe_allow_html=True)
+    async def staggered_run(coro, delay):
+        await asyncio.sleep(delay)
+        return await coro
+
+    # Stage 1: Stagger by 2 seconds each
     t1 = run_agent("DeepSeek", task, config.DEEPSEEK_PROMPT, placeholders_dict["DeepSeek"], status_placeholders_dict["DeepSeek"])
     t2 = run_agent("GLM", task, config.GLM_PROMPT, placeholders_dict["GLM"], status_placeholders_dict["GLM"])
     t3 = run_agent("Qwen", task, config.QWEN_PROMPT, placeholders_dict["Qwen"], status_placeholders_dict["Qwen"])
     
-    res1, res2, res3 = await asyncio.gather(t1, t2, t3, return_exceptions=True)
+    res1, res2, res3 = await asyncio.gather(
+        staggered_run(t1, 0),
+        staggered_run(t2, 2),
+        staggered_run(t3, 4),
+        return_exceptions=True
+    )
     
     # Handle possible exceptions returned by gather
     if isinstance(res1, Exception): res1 = f"Error: {res1}"
     if isinstance(res2, Exception): res2 = f"Error: {res2}"
     if isinstance(res3, Exception): res3 = f"Error: {res3}"
     
-    # Stage 2
+    # Stage 2: Stagger debates
     global_status_placeholder.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Консилиум проводит дебаты и критикует решения...</i></div>", unsafe_allow_html=True)
     answers = {"DeepSeek": res1, "GLM": res2, "Qwen": res3}
     d1 = run_debate("DeepSeek", res1, answers, placeholders_dict["DeepSeek"], status_placeholders_dict["DeepSeek"])
     d2 = run_debate("GLM", res2, answers, placeholders_dict["GLM"], status_placeholders_dict["GLM"])
     d3 = run_debate("Qwen", res3, answers, placeholders_dict["Qwen"], status_placeholders_dict["Qwen"])
     
-    await asyncio.gather(d1, d2, d3, return_exceptions=True)
+    await asyncio.gather(
+        staggered_run(d1, 0),
+        staggered_run(d2, 2),
+        staggered_run(d3, 4),
+        return_exceptions=True
+    )
     
     # Stage 3
     global_status_placeholder.markdown("<div class='thinking-box'><div class='pulse-dot'></div> <i>Главный Оценщик формирует финальный вердикт...</i></div>", unsafe_allow_html=True)

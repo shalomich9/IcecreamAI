@@ -24,30 +24,90 @@ GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")  # tavily.com, 1000 бесплатных запросов/месяц
 
 # ============================================================
-# НАСТРОЙКА МОДЕЛЕЙ
-# Актуальный список free-моделей: openrouter.ai/models
+# АВТОПОДБОР МОДЕЛЕЙ
+# Бесплатные модели у OpenRouter и Google меняются очень часто
+# (список может обновляться раз в несколько дней). Вместо того
+# чтобы вручную вписывать ID, код сам спрашивает у обоих сервисов,
+# что доступно ПРЯМО СЕЙЧАС, и подставляет рабочие варианты.
+# Обновляется раз в час (кэш), чтобы не дёргать API на каждый запрос.
 # ============================================================
-MODELS = [
-    {
-        "name": "DeepSeek",
-        "provider": "openrouter",
-        # DeepSeek больше не бесплатен на OpenRouter (перевели на платный доступ).
-        # openrouter/free — автороутер: сам выбирает доступную бесплатную модель
-        # под задачу и не ломается, когда конкретные :free модели исчезают.
-        "model_id": "openrouter/free",
-    },
-    {
-        "name": "GLM",
-        "provider": "openrouter",
-        "model_id": "z-ai/glm-4.5-air:free",
-    },
-    {
-        "name": "Gemini",
-        "provider": "google",
-        # gemini-1.5-pro устарел (сентябрь 2025). Актуальная бесплатная версия — 2.5-flash.
-        "model_id": "gemini-2.5-flash",
-    },
-]
+async def fetch_openrouter_free_models() -> list:
+    """Живой список бесплатных моделей OpenRouter (id вида provider/model:free)."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get("https://openrouter.ai/api/v1/models")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return []
+
+    free_ids = []
+    for m in data.get("data", []):
+        model_id = m.get("id", "")
+        pricing = m.get("pricing", {})
+        try:
+            prompt_price = float(pricing.get("prompt") or 1)
+            completion_price = float(pricing.get("completion") or 1)
+        except (TypeError, ValueError):
+            continue
+        if prompt_price == 0 and completion_price == 0 and model_id.endswith(":free"):
+            free_ids.append(model_id)
+    return free_ids
+
+
+async def fetch_gemini_flash_model() -> str:
+    """Спрашивает у Google, какая Flash-модель сейчас доступна для generateContent."""
+    if not GOOGLE_API_KEY:
+        return "gemini-2.0-flash"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return "gemini-2.0-flash"
+
+    candidates = []
+    for m in data.get("models", []):
+        name = m.get("name", "").replace("models/", "")
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" in methods and "flash" in name.lower():
+            candidates.append(name)
+
+    stable = [c for c in candidates if "exp" not in c and "preview" not in c and "8b" not in c]
+    pool = stable or candidates
+    return pool[0] if pool else "gemini-2.0-flash"
+
+
+def pretty_model_name(model_id: str) -> str:
+    if model_id == "openrouter/free":
+        return "OpenRouter (авто)"
+    base = model_id.split("/")[-1].replace(":free", "")
+    return base.replace("-", " ").title()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_models():
+    free_models = asyncio.run(fetch_openrouter_free_models())
+    gemini_model_id = asyncio.run(fetch_gemini_flash_model())
+
+    # предпочитаем разные "семейства" моделей для разнообразия мнений
+    pref_a = [m for m in free_models if any(k in m.lower() for k in ["deepseek", "qwen", "nemotron", "gpt-oss", "hermes", "kimi"])]
+    pref_b = [m for m in free_models if "glm" in m.lower()]
+
+    model_a = pref_a[0] if pref_a else (free_models[0] if free_models else "openrouter/free")
+    model_b = pref_b[0] if pref_b else next((m for m in free_models if m != model_a), "openrouter/free")
+
+    return [
+        {"name": pretty_model_name(model_a), "provider": "openrouter", "model_id": model_a},
+        {"name": pretty_model_name(model_b), "provider": "openrouter", "model_id": model_b},
+        {"name": pretty_model_name(gemini_model_id), "provider": "google", "model_id": gemini_model_id},
+    ]
+
+
+MODELS = resolve_models()
 
 # ============================================================
 # LEVEL 5 — разбит на 4 последовательных шага с разной температурой.
@@ -102,7 +162,8 @@ async def call_openrouter_model(model_id: str, messages: list, temperature: floa
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
             return "[Недоступно: превышен бесплатный лимит запросов. Попробуйте через пару минут.]"
-        return f"[Ошибка запроса: {e.response.status_code}]"
+        detail = e.response.text[:150]
+        return f"[Ошибка запроса: {e.response.status_code} — {detail}]"
     except Exception as e:
         return f"[Ошибка: {str(e)[:200]}]"
 
@@ -115,7 +176,7 @@ async def call_gemini_model(model_id: str, system_prompt: str, contents: list, t
         return "[Ошибка: не задан GOOGLE_API_KEY в Secrets]"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={GOOGLE_API_KEY}"
     payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": {"temperature": temperature},
     }
@@ -128,7 +189,8 @@ async def call_gemini_model(model_id: str, system_prompt: str, contents: list, t
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
             return "[Недоступно: превышен бесплатный лимит запросов. Попробуйте через пару минут.]"
-        return f"[Ошибка запроса: {e.response.status_code}]"
+        detail = e.response.text[:150]
+        return f"[Ошибка запроса: {e.response.status_code} — {detail}]"
     except Exception as e:
         return f"[Ошибка: {str(e)[:200]}]"
 
@@ -215,6 +277,7 @@ async def search_web(query: str) -> str:
 st.set_page_config(page_title="AI Council", page_icon="🧠", layout="centered")
 st.title("🧠 Мульти-ИИ консилиум")
 st.caption("Этап 1: каждая модель прорабатывает задачу независимо (Level 5, 4 шага).")
+st.caption("Сейчас работают: " + ", ".join(m["name"] for m in MODELS))
 
 if "history" not in st.session_state:
     st.session_state.history = []  # список {"role": "user"/"assistant", "content": str}

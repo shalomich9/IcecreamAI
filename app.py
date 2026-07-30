@@ -31,17 +31,21 @@ MODELS = [
     {
         "name": "DeepSeek",
         "provider": "openrouter",
-        "model_id": "deepseek/deepseek-r1:free",
+        # DeepSeek больше не бесплатен на OpenRouter (перевели на платный доступ).
+        # openrouter/free — автороутер: сам выбирает доступную бесплатную модель
+        # под задачу и не ломается, когда конкретные :free модели исчезают.
+        "model_id": "openrouter/free",
     },
     {
         "name": "GLM",
         "provider": "openrouter",
-        "model_id": "thudm/glm-4-32b:free",
+        "model_id": "z-ai/glm-4.5-air:free",
     },
     {
         "name": "Gemini",
         "provider": "google",
-        "model_id": "gemini-1.5-pro",
+        # gemini-1.5-pro устарел (сентябрь 2025). Актуальная бесплатная версия — 2.5-flash.
+        "model_id": "gemini-2.5-flash",
     },
 ]
 

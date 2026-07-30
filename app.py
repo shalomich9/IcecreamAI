@@ -6,6 +6,96 @@ from agents import generate_response
 
 st.set_page_config(page_title="AI Council Simulator", layout="wide", initial_sidebar_state="expanded")
 
+# Inject Custom CSS for UI
+st.markdown("""
+<style>
+    /* Global Background and Colors */
+    .stApp {
+        background-color: #0d1117;
+        color: #c9d1d9;
+    }
+    
+    /* Text Inputs and Text Areas */
+    .stTextArea textarea {
+        background-color: #161b22 !important;
+        color: #c9d1d9 !important;
+        border: 1px solid #30363d !important;
+        border-radius: 12px !important;
+        padding: 16px !important;
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.075) !important;
+        transition: all 0.3s ease !important;
+    }
+    .stTextArea textarea:focus {
+        border-color: #58a6ff !important;
+        box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.3) !important;
+    }
+
+    /* Buttons */
+    .stButton>button {
+        background: linear-gradient(135deg, #1f6feb, #8957e5, #3fb950);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        padding: 10px 24px;
+        font-weight: 600;
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 20px rgba(137, 87, 229, 0.4);
+    }
+    
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background-color: transparent;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #21262d;
+        border-radius: 8px 8px 0 0;
+        border: none;
+        color: #8b949e;
+        padding-top: 10px;
+        padding-bottom: 10px;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, rgba(31, 111, 235, 0.1), rgba(137, 87, 229, 0.1));
+        color: #58a6ff;
+        border-bottom: 2px solid #58a6ff;
+    }
+
+    /* Sidebars */
+    section[data-testid="stSidebar"] {
+        background-color: #161b22;
+        border-right: 1px solid #30363d;
+    }
+    
+    /* Headers and Gradients */
+    h1, h2, h3 {
+        background: -webkit-linear-gradient(45deg, #58a6ff, #a371f7, #3fb950);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 800 !important;
+    }
+
+    /* Information boxes (statuses) */
+    .stAlert {
+        background-color: rgba(33, 38, 45, 0.8) !important;
+        border: 1px solid #30363d !important;
+        border-left: 4px solid #8957e5 !important;
+        color: #c9d1d9 !important;
+        border-radius: 8px !important;
+    }
+    
+    /* Markdown Text */
+    .stMarkdown p {
+        font-size: 1.05rem;
+        line-height: 1.6;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
 # Initialize session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -144,13 +234,6 @@ st.sidebar.subheader("Статусы")
 for agent in ["DeepSeek", "GLM", "Qwen", "Evaluator"]:
     status = st.session_state.agent_status.get(agent, "Ожидание")
     st.sidebar.caption(f"**{agent}**: {status}")
-
-st.sidebar.markdown("---")
-if st.sidebar.button("Очистить историю"):
-    st.session_state.chat_history = []
-    st.session_state.agent_outputs = {k: "" for k in st.session_state.agent_outputs}
-    st.session_state.agent_status = {k: "Ожидание" for k in st.session_state.agent_status}
-    st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("История сессий")

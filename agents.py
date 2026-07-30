@@ -17,14 +17,10 @@ clients = {
 
 # The specific models to use in NIM
 MODELS = {
-    # DeepSeek v4 Pro/R1 equivalent or fallback (NVIDIA NIM supports deepseek-coder-6.7b-instruct etc. 
-    # we'll use a placeholder or general model if exact isn't available, but user said DeepSeek v4 Pro / R1.
-    # Llama 3.1 70B is a good proxy if DeepSeek string fails, but we'll try to use the ones provided)
-    # Using specific model names for NVIDIA NIM:
-    "DeepSeek": "deepseek-ai/deepseek-r1", # Might need adjustment depending on NVIDIA NIM actual deployment names
-    "GLM": "zhipuai/glm-4-9b-chat", # GLM 5.2 might be coming, let's use a generic GLM placeholder
-    "Qwen": "qwen/qwen2.5-72b-instruct",
-    "Evaluator": "meta/llama-3.1-405b-instruct",
+    "DeepSeek": "deepseek-ai/deepseek-v4-pro",
+    "GLM": "z-ai/glm-5.2",
+    "Qwen": "meta/llama-3.3-70b-instruct", # Fallback for Qwen on NIM
+    "Evaluator": "nvidia/nemotron-4-340b-instruct",
 }
 
 async def search_tavily(query: str) -> str:
